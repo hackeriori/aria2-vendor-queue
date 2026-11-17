@@ -2,6 +2,10 @@
 
 为 aria2 提供按 **网盘厂商（Alist 挂载点）** 划分的独立下载队列。
 
+同一个进程里还跑着第二部分：**夸克网盘「转存窗口」调度器**（`quark_window.py`）——
+把"删网盘腾空间 → 网页转存 → 复制直链 → 加 aria2 任务"这条手工流水线全自动闭环，
+适用于网盘容量小（如免费号 30G）、单集却 8G 的场景。详见 [夸克转存窗口](#夸克转存窗口quark_window)。
+
 ## 解决什么问题
 
 Alist 挂载了多个网盘（夸克、百度网盘、迅雷云盘、阿里云、天翼云盘），各厂商独立限速：
@@ -98,6 +102,112 @@ python3 aria2_vendor_queue.py --verbose
 - 推荐用环境变量 `ARIA2_RPC_SECRET` 传入密钥，配置文件里 `secret` 留空即可；
 - 建议 aria2 的 RPC 端口只在内网暴露，不要直接映射到公网。
 
+## 夸克转存窗口（quark_window）
+
+### 解决什么问题
+
+夸克免费号只有 30G 左右，4K 单集 8G，一次只放得下两三集。手工流程是：
+
+```
+Alist 里删旧的腾空间 → Windows 浏览器打开分享链接保存 3 集
+→ Alist 复制直链 → AriaNg 添加任务 → 等 5 小时下完 → 再循环
+```
+
+免费号实测 490KB/s，一集要 5 小时，一季 12 集要守 3 天——人工不可持续。
+
+### 闭环
+
+调度器每轮（默认 60s）对每个任务做四件事：
+
+1. **回收**：本地已下完的集 → 从夸克删除，释放配额；
+2. **入队**：网盘里有、本地没下完、aria2 里没有在跑 → 取 Alist 直链 → `aria2.addUri`；
+3. **补位**：算剩余容量，只转存"放得下"的下一集（留 `reserveGB` 余量）；
+4. 重复，直到分享里的集全部下完。
+
+两个任务类型：
+
+| type | 作用 |
+|---|---|
+| `share` | 从分享链接自动转存 + 入队 + 下完删除（追剧流水线） |
+| `reclaim` | 只做回收：把某个夸克目录里"本地已下完"的文件删掉（清历史遗留） |
+
+### 安全边界（删文件是唯一高风险动作）
+
+删除必须**同时**满足以下全部条件，任一不满足就跳过：
+
+- 文件在**本任务配置的目录内**（`saveDir` / `quarkDir`），绝不跨目录；
+- 本地文件存在且**大小与网盘完全相等**；
+- 本地**没有 `.aria2` 控制文件**——aria2 开了 `file-allocation=falloc`/多线程时，文件在下载途中就可能达到完整大小，只看大小会把"正在下载"误判成"已下完"；
+- 该文件名**不在 aria2 的 active / waiting / paused 队列**里；
+- 删除进**夸克回收站**（可恢复），不是永久删除；
+- `quark.dryRun=true` 时只打日志不动手。
+
+### 配置
+
+```json
+"quark": {
+  "enabled": true,
+  "cookie": "夸克网页版 cookie",
+  "pollIntervalSec": 60,
+  "reserveGB": 4,
+  "maxSavedEpisodes": 2,
+  "deleteAfterDone": true,
+  "alistMountPath": "/夸克",
+  "alist": { "baseUrl": "http://alist:5244", "username": "admin", "password": "***" },
+  "jobs": [
+    { "name": "巨人S2", "type": "share",
+      "shareUrl": "https://pan.quark.cn/s/xxxxxxxx",
+      "include": ["S2"],
+      "saveDir": "来自：分享/_pipe/巨人S2",
+      "localDir": "/downloads/进击的巨人/S02",
+      "enabled": true }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `cookie` | 夸克网页版 cookie；也可留空用环境变量 `QUARK_COOKIE` |
+| `reserveGB` | 预留空间，避免把配额吃满导致转存失败（默认 4） |
+| `maxSavedEpisodes` | 同时留在网盘里"未下完"的集数上限，即窗口大小（默认 2：1 集在下载 + 1 集预存） |
+| `deleteAfterDone` | 下完是否自动删网盘文件（关掉就只下载不清理） |
+| `alist.*` | 取 `/d/` 直链必须登录 Alist（签名只能由 Alist 生成），建议单独建一个只读该挂载的账号 |
+| `jobs[].include` | 匹配分享内路径的子串，用来挑季/子目录（写 `S2` 只会匹配到含 `S2` 的目录） |
+| `jobs[].saveDir` | 转到夸克里的哪个目录（自动创建），每个任务用自己的目录，便于回收时精确控制范围 |
+| `jobs[].localDir` | aria2 的下载目录（**aria2 容器内的路径**，如 `/downloads/...`） |
+
+> 多个 `share` 任务可以同时开启：真正的硬约束是实时剩余容量，窗口只是软上限，不会超配额。
+
+### 验证与观察
+
+```bash
+# 只跑转存窗口、只跑一轮、只打印不执行
+docker exec -w /app <容器名> python aria2_vendor_queue.py --pipeline-only --once --dry-run -v
+
+# 看实时动作
+docker logs -f <容器名> | grep quark-window
+
+# 看每个任务已完成/已删的记录
+cat state/quark-window.json
+```
+
+日志形如：
+
+```
+[quark-window] 巨人S2｜分享 12 集，已完成 3，网盘在盘 2 集，剩余空间 9.03G，本轮可再转存 0 集
+[quark-window] 已转存：[Spade4K] Shingeki no Kyojin S2 04 (...).mkv（8.35G）
+[quark-window] 已入队：[Spade4K] ... S2 04 (...).mkv（第 1 次）
+[quark-window] 已释放配额：删除网盘文件 ... S2 01 (...).mkv（8.35G）
+```
+
+### 踩过的两个坑（已内置处理）
+
+- **Alist 目录缓存是分层的**：刚转存的文件，只刷新叶子父目录不够，祖先目录缓存还是旧的，
+  `fs/get` 会报 `failed get parent list: object not found`。实现里从根往下逐级 `refresh`。
+- **Alist 可能返回 `/p/`（代理）而不是 `/d/`（直链）**：`/p/` 会让厂商队列分类失效
+  （分类靠 URL 里的 `/d/<挂载名>/`）。两者签名都是按文件路径算的，实现里统一改写成 `/d/`，
+  同时分类规则也兼容 `/p/`。
+
 ## 部署
 
 推荐跑在 aria2 所在服务器上（docker-compose 或 systemd 二选一）：
@@ -108,8 +218,16 @@ python3 aria2_vendor_queue.py --verbose
   vendor-queue:
     image: python:3.12-alpine
     restart: unless-stopped
+    # 必须和 aria2 / alist 在同一个 docker 网络，否则 http://alist:5244、http://aria2:6800 解析不到
+    networks: ["Aria2"]
+    environment:
+      - TZ=CST-8
+      # 可选：用环境变量代替 config.json 里的明文 cookie
+      # - QUARK_COOKIE=...
     volumes:
       - ./aria2-vendor-queue:/app
+      # 转存窗口要按"本地文件大小"校验是否下完，必须挂到与 aria2 容器相同的下载目录
+      - /mnt/sdb1/download:/downloads
     working_dir: /app
     command: python aria2_vendor_queue.py
     # 若 rpc 走内网地址，写 http://aria2:6800/jsonrpc 即可

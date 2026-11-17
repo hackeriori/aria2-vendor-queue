@@ -34,7 +34,9 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -121,7 +123,11 @@ class SizedDatedRotatingHandler(logging.handlers.BaseRotatingHandler):
 
 
 def setup_logging(cfg, cfg_dir):
-    """按配置初始化日志：同时输出到 stdout（docker logs）和轮转日志文件。"""
+    """按配置初始化日志：同时输出到 stdout（docker logs）和轮转日志文件。
+
+    两个子模块（vendor-queue / quark-window）共用同一组 handler，
+    日志前缀用 logger 名区分，避免同一文件被两个文件句柄各写一份、轮转时打架。
+    """
     raw = cfg.get("logFile") or os.path.join("logs", "vendor-queue.log")
     log_file = raw if os.path.isabs(raw) else os.path.join(cfg_dir, raw)
     log_file = os.path.abspath(log_file)
@@ -130,24 +136,26 @@ def setup_logging(cfg, cfg_dir):
     except OSError:
         pass
 
-    fmt = logging.Formatter("%(asctime)s " + TAG + " %(message)s",
+    fmt = logging.Formatter("%(asctime)s [%(name)s] %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
-    _logger.setLevel(logging.INFO)
-    _logger.handlers.clear()
-    _logger.propagate = False
-
     fh = SizedDatedRotatingHandler(
         log_file,
         max_bytes=cfg.get("logMaxBytes", DEFAULT_LOG_MAX_BYTES),
         retention_days=cfg.get("logRetentionDays", DEFAULT_LOG_RETENTION_DAYS),
     )
     fh.setFormatter(fmt)
-    _logger.addHandler(fh)
     fh.purge_old_backups()  # 启动时也清理一次过期备份
 
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
-    _logger.addHandler(sh)
+
+    for name in ("vendor-queue", "quark-window"):
+        lgr = logging.getLogger(name)
+        lgr.setLevel(logging.INFO)
+        lgr.handlers.clear()
+        lgr.propagate = False
+        lgr.addHandler(fh)
+        lgr.addHandler(sh)
     return log_file
 
 
@@ -445,12 +453,46 @@ class Scheduler:
                 return
 
 
+def build_window(cfg, cfg_dir, rpc, dry_run, verbose):
+    """按 config.quark 构造转存窗口调度器；未启用或未配置 cookie 时返回 None。"""
+    qcfg = cfg.get("quark") or {}
+    if not qcfg.get("enabled"):
+        return None
+    wlog = logging.getLogger("quark-window")
+    cookie = (qcfg.get("cookie") or "").strip()
+    if not cookie:
+        env_name = qcfg.get("cookieEnv", "QUARK_COOKIE")
+        cookie = (os.environ.get(env_name) or "").strip()
+    if not cookie:
+        wlog.info("未配置夸克 cookie（config.quark.cookie 或环境变量），跳过转存窗口调度")
+        return None
+    try:
+        from alist_client import AlistClient
+        from quark_client import QuarkClient
+        from quark_window import WindowScheduler
+
+        acfg = qcfg.get("alist") or {}
+        if not acfg.get("baseUrl") or not acfg.get("username"):
+            wlog.info("config.quark.alist 未配置 baseUrl/username，跳过转存窗口调度")
+            return None
+        quark = QuarkClient(cookie, logger=wlog.info)
+        alist = AlistClient(acfg.get("baseUrl"), acfg.get("username"),
+                            acfg.get("password", ""), logger=wlog.info)
+        alist.login()
+        return WindowScheduler(quark, alist, rpc, qcfg, cfg_dir,
+                               dry_run=dry_run, verbose=verbose, logger=wlog.info)
+    except Exception as e:
+        wlog.info("转存窗口调度器初始化失败，本次只跑队列调度: %s" % e)
+        return None
+
+
 def main():
-    ap = argparse.ArgumentParser(description="aria2 按网盘厂商分队列调度器")
+    ap = argparse.ArgumentParser(description="aria2 按网盘厂商分队列调度器 + 夸克转存窗口")
     ap.add_argument("-c", "--config", default=None, help="配置文件路径 (默认: 脚本同目录 config.json)")
-    ap.add_argument("-n", "--dry-run", action="store_true", help="只打印将要执行的动作，不真正暂停/恢复任务")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="只打印将要执行的动作，不真正暂停/恢复/转存/删除")
     ap.add_argument("-1", "--once", action="store_true", help="只执行一轮调度（用于验证/测试）")
-    ap.add_argument("-v", "--verbose", action="store_true", help="输出每轮的分类汇总日志")
+    ap.add_argument("-v", "--verbose", action="store_true", help="输出每轮的明细日志")
+    ap.add_argument("--pipeline-only", action="store_true", help="只跑夸克转存窗口，不跑厂商队列调度")
     args = ap.parse_args()
 
     try:
@@ -479,6 +521,25 @@ def main():
         % (cfg["rpc"], args.dry_run, cfg.get("pollIntervalSec", 3), log_file,
            int(cfg.get("logMaxBytes", DEFAULT_LOG_MAX_BYTES)) // (1024 * 1024),
            int(cfg.get("logRetentionDays", DEFAULT_LOG_RETENTION_DAYS))))
+
+    window = build_window(cfg, os.path.dirname(os.path.abspath(cfg_path)), rpc,
+                          args.dry_run, args.verbose)
+
+    if args.pipeline_only:
+        if window is None:
+            print("--pipeline-only 需要 config.quark 启用，且 cookie / alist 配置完整",
+                  file=sys.stderr)
+            sys.exit(1)
+        window.run(once=args.once)
+        return
+
+    if window is not None:
+        if args.once:
+            window.tick()
+        else:
+            threading.Thread(target=window.run, name="quark-window", daemon=True).start()
+            log("转存窗口调度器已在后台线程启动")
+
     sched.run(rpc, once=args.once)
 
 

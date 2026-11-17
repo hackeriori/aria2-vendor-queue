@@ -8,3 +8,6 @@ state.json
 # Python
 __pycache__/
 *.pyc
+
+# 转存窗口运行状态
+state/
