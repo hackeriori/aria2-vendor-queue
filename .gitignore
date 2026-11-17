@@ -1,0 +1,10 @@
+# 本地真实配置与运行状态，绝不提交
+config.json
+state.json
+
+# 部署/运行环境里的凭据
+.deploy/
+
+# Python
+__pycache__/
+*.pyc

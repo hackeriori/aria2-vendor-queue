@@ -1,0 +1,19 @@
+{
+  "rpc": "https://aria2.example.com/jsonrpc",
+  "secret": "",
+  "secretEnv": "ARIA2_RPC_SECRET",
+  "pollIntervalSec": 3,
+  "logFile": "logs/vendor-queue.log",
+  "logMaxBytes": 10485760,
+  "logRetentionDays": 30,
+  "autoAdjustGlobalLimit": true,
+  "defaultCategory": "默认",
+  "defaultMaxConcurrent": 1,
+  "categories": [
+    { "name": "夸克", "match": ["/d/夸克/"], "maxConcurrent": 1 },
+    { "name": "百度网盘", "match": ["/d/百度网盘/"], "maxConcurrent": 1 },
+    { "name": "迅雷云盘", "match": ["/d/迅雷云盘/"], "maxConcurrent": 1 },
+    { "name": "阿里云", "match": ["/d/阿里云/"], "maxConcurrent": 1 },
+    { "name": "天翼云盘", "match": ["/d/天翼云盘客户端/"], "maxConcurrent": 1 }
+  ]
+}
