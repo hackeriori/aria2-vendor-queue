@@ -155,11 +155,11 @@ Alist 里删旧的腾空间 → Windows 浏览器打开分享链接保存 3 集
   "alistMountPath": "/夸克",
   "alist": { "baseUrl": "http://alist:5244", "username": "admin", "password": "***" },
   "jobs": [
-    { "name": "巨人S2", "type": "share",
+    { "name": "示例剧S2", "type": "share",
       "shareUrl": "https://pan.quark.cn/s/xxxxxxxx",
       "include": ["S2"],
-      "saveDir": "来自：分享/_pipe/巨人S2",
-      "localDir": "/downloads/进击的巨人/S02",
+      "saveDir": "来自：分享/_pipe/示例剧S2",
+      "localDir": "/downloads/示例剧/S02",
       "enabled": true }
   ]
 }
@@ -175,8 +175,41 @@ Alist 里删旧的腾空间 → Windows 浏览器打开分享链接保存 3 集
 | `jobs[].include` | 匹配分享内路径的子串，用来挑季/子目录（写 `S2` 只会匹配到含 `S2` 的目录） |
 | `jobs[].saveDir` | 转到夸克里的哪个目录（自动创建），每个任务用自己的目录，便于回收时精确控制范围 |
 | `jobs[].localDir` | aria2 的下载目录（**aria2 容器内的路径**，如 `/downloads/...`） |
+| `jobs[].maxSavedEpisodes` | 可选，按任务覆盖全局窗口大小。单集补漏设 `1` |
+| `jobs[].reserveGB` | 可选，按任务覆盖全局预留空间。补最后一集时设小一点（如 `0.5`）才能塞进去 |
 
 > 多个 `share` 任务可以同时开启：真正的硬约束是实时剩余容量，窗口只是软上限，不会超配额。
+> **任务按数组顺序补位**——排在前面的先抢空间，想插队就把它的对象往前挪。
+
+`config.example.json` 里每个字段都带中文说明（集中在顶层 `_说明` 里，按配置树状组织），
+且所有 URL / 密钥 / cookie 均为占位符，可直接复制为 `config.json` 后填值。
+
+### 以后怎么加新任务
+
+是的，就是改 `config.json` 再重启容器（配置在启动时读取一次）：
+
+```bash
+# 1. 编辑任务（在 quark.jobs 数组里加一项，或把已有项的 enabled 改成 true）
+vi ~/aria2-vendor-queue/config.json
+
+# 2. 重启生效
+docker restart aria2-vendor-queue
+
+# 3. 看它认到了几集（只演不执行，确认 include 规则没写错）
+docker exec -w /app aria2-vendor-queue \
+  python aria2_vendor_queue.py --pipeline-only --once --dry-run -v
+```
+
+三种常见改法：
+
+| 想做的事 | 怎么改 |
+|---|---|
+| 追下一季 | 把该季任务对象的 `"enabled": false` 改成 `true` |
+| 补某一集 | 新建 `share` 任务，`include` 写成"季目录名/文件名片段"（跨 `/` 的串才精确），窗口设 1 |
+| 加一部新剧 | 新 `share` 任务：换 `shareUrl`、`include`、`saveDir`（新建独占目录）、`localDir` |
+
+`state/quark-window.json` 按任务名记录"已下完并已删"的清单，所以同一个任务重启后不会重复转存；
+**改任务名等于换了一个新任务**，该剧会从头再转一遍——改名时记得同步改 `name` 之外的状态，或直接接受重来。
 
 ### 验证与观察
 
@@ -194,9 +227,9 @@ cat state/quark-window.json
 日志形如：
 
 ```
-[quark-window] 巨人S2｜分享 12 集，已完成 3，网盘在盘 2 集，剩余空间 9.03G，本轮可再转存 0 集
-[quark-window] 已转存：[Spade4K] Shingeki no Kyojin S2 04 (...).mkv（8.35G）
-[quark-window] 已入队：[Spade4K] ... S2 04 (...).mkv（第 1 次）
+[quark-window] 示例剧S2｜分享 12 集，已完成 3，网盘在盘 2 集，剩余空间 9.03G，本轮可再转存 0 集
+[quark-window] 已转存：[示例组] Example Show S2 04 (...).mkv（8.35G）
+[quark-window] 已入队：[示例组] Example Show S2 04 (...).mkv（第 1 次）
 [quark-window] 已释放配额：删除网盘文件 ... S2 01 (...).mkv（8.35G）
 ```
 
@@ -227,7 +260,7 @@ cat state/quark-window.json
     volumes:
       - ./aria2-vendor-queue:/app
       # 转存窗口要按"本地文件大小"校验是否下完，必须挂到与 aria2 容器相同的下载目录
-      - /mnt/sdb1/download:/downloads
+      - /你的下载目录:/downloads
     working_dir: /app
     command: python aria2_vendor_queue.py
     # 若 rpc 走内网地址，写 http://aria2:6800/jsonrpc 即可

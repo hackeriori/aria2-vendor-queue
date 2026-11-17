@@ -1,5 +1,62 @@
 {
-  "rpc": "https://aria2.example.com/jsonrpc",
+  "_说明": {
+    "_总览": "本文件是示例模板：所有 URL / 密钥 / cookie 都是占位符，复制成 config.json 后填入你自己的值。config.json、state/、.deploy/ 已在 .gitignore 中，不会被提交。",
+    "rpc": "aria2 的 JSON-RPC 地址。同机 docker 网络内用 http://aria2:6800/jsonrpc；走公网则填你的域名。",
+    "secret": "aria2 RPC 密钥（即 aria2.conf 里的 rpc-secret）。留空则从 secretEnv 指定的环境变量读取。",
+    "secretEnv": "secret 为空时，从此环境变量读取密钥，默认 ARIA2_RPC_SECRET。",
+    "pollIntervalSec": "厂商队列调度的轮询间隔（秒），默认 3。越小响应越快，开销可忽略。",
+    "logFile": "日志文件路径，相对路径以配置目录为准；同时输出到 stdout（docker logs）。",
+    "logMaxBytes": "单个日志文件最大字节数，达到后带时间戳轮转，默认 10M。",
+    "logRetentionDays": "历史日志保留天数，超期自动清理，默认 30 天。",
+    "autoAdjustGlobalLimit": "启动时是否自动把 aria2 全局 max-concurrent-downloads 调到「各分类并发之和 + 默认分类并发」。",
+    "defaultCategory": "不匹配任何规则的下载（磁力、BT、直链等）归入的分类名。",
+    "defaultMaxConcurrent": "默认分类的并发上限。",
+    "categories": {
+      "_说明": "按 URL 分类的规则。/d/ 是 Alist 直链路由、/p/ 是代理路由，两种前缀都要写，否则部分任务会漏分类。",
+      "name": "分类名（只用于日志和统计）。",
+      "match": "URL 解码后的路径子串，命中即归入该分类。写 Alist 挂载点名即可，如 /d/夸克/。",
+      "maxConcurrent": "该分类的并发上限。同一厂商串行（=1），不同厂商并行叠加带宽。"
+    },
+    "quark": {
+      "_说明": "夸克「转存窗口」调度器：小容量网盘 + 大文件时的自动转存/下载/清理闭环。不需要可整体删掉或 enabled=false。",
+      "enabled": "是否启用转存窗口调度。false 时只跑厂商队列调度。",
+      "cookie": "夸克网页版 cookie（浏览器 F12 复制整段）。留空则读 cookieEnv 指定的环境变量，建议用环境变量避免明文。",
+      "cookieEnv": "存放 cookie 的环境变量名，默认 QUARK_COOKIE。",
+      "pollIntervalSec": "转存窗口轮询间隔（秒），默认 60。转存/删除都是慢动作，不需要更快。",
+      "dryRun": "true = 只打印将要执行的动作，不转存、不入队、不删除。上线前先用它验证一遍。",
+      "reserveGB": "全局预留空间（GB），默认 4。避免把配额吃满导致转存失败；可按任务覆盖。",
+      "maxSavedEpisodes": "窗口大小：同时留在网盘里「未下完」的文件数上限，默认 2（1 个在下载 + 1 个预存）。可按任务覆盖。",
+      "deleteAfterDone": "本地确认下完后是否自动删除网盘文件以释放配额。false 则只下载不清理。",
+      "maxRetries": "同一文件连续重试入队的上限，默认 6。超过后暂停重试 1 小时，避免对失效链接死循环。",
+      "shareCacheSec": "分享目录清单的缓存秒数，默认 300。避免每轮都递归遍历整个分享。",
+      "alistMountPath": "夸克在 Alist 里的挂载路径，如 /夸克。用于拼出取直链所需的 Alist 路径。",
+      "stateFile": "运行状态（已完成/已删除记录）文件路径，默认 state/quark-window.json。",
+      "alist": {
+        "_说明": "取 /d/ 直链必须登录 Alist（直链签名只能由 Alist 生成）。建议单独建一个只读该挂载的账号，不要用管理员。",
+        "baseUrl": "Alist 地址。与 Alist 同 docker 网络时用 http://alist:5244。",
+        "username": "Alist 账号。",
+        "password": "Alist 密码。"
+      },
+      "jobs": {
+        "_说明": "任务列表。按数组顺序补位：排在前面的任务先抢空间，想插队就把它的对象往前挪。",
+        "name": "任务名，仅用于日志；同时作为状态文件里的键，改名会重置该任务的完成记录。",
+        "type": "share = 从分享链接自动转存 + 下载 + 清理；reclaim = 只清理某个网盘目录里「本地已下完」的文件。",
+        "shareUrl": "夸克分享链接，程序自动解析出 pwd_id。",
+        "pwdId": "可选，分享 ID（链接 /s/ 后面那段）。一般留空，由 shareUrl 自动解析。",
+        "passcode": "可选，分享的提取码（4 位）。公开分享留空。",
+        "include": "只转存分享内路径包含这些子串的文件（OR 关系）。写季名可整季追；只想补某一集时，用跨目录的串，如 \"全25集/[示例组] Example Show 25 \"。",
+        "exclude": "排除项：路径包含任一子串就跳过，可用来滤掉预告、花絮。",
+        "saveDir": "转存到你自己网盘的哪个目录（自动创建）。每个任务用独立目录，回收时才能精确限定删除范围。",
+        "localDir": "aria2 的下载目录，必须是 aria2 容器内的路径（如 /downloads/剧名/S02）。",
+        "quarkDir": "仅 reclaim 用：要清理的网盘目录（相对网盘根，如 来自：分享/4K）。",
+        "maxSavedEpisodes": "仅 share 用：覆盖全局窗口大小。单集补漏设成 1 即可。",
+        "reserveGB": "仅 share 用：覆盖全局预留空间。补最后一集时可设小一点（如 0.5）以便塞进去。",
+        "enabled": "是否启用该任务。"
+      }
+    }
+  },
+
+  "rpc": "http://aria2:6800/jsonrpc",
   "secret": "",
   "secretEnv": "ARIA2_RPC_SECRET",
   "pollIntervalSec": 3,
@@ -16,6 +73,7 @@
     { "name": "阿里云", "match": ["/d/阿里云/", "/p/阿里云/"], "maxConcurrent": 1 },
     { "name": "天翼云盘", "match": ["/d/天翼云盘客户端/", "/p/天翼云盘客户端/"], "maxConcurrent": 1 }
   ],
+
   "quark": {
     "enabled": false,
     "cookie": "",
@@ -26,28 +84,40 @@
     "maxSavedEpisodes": 2,
     "deleteAfterDone": true,
     "maxRetries": 6,
+    "shareCacheSec": 300,
     "alistMountPath": "/夸克",
     "stateFile": "state/quark-window.json",
     "alist": {
       "baseUrl": "http://alist:5244",
-      "username": "admin",
+      "username": "alist-user",
       "password": ""
     },
     "jobs": [
       {
-        "name": "示例-剧集S2",
+        "name": "示例-整季追更",
         "type": "share",
-        "shareUrl": "https://pan.quark.cn/s/xxxxxxxxxxxx",
+        "shareUrl": "https://pan.quark.cn/s/000000000000",
         "include": ["S2"],
         "saveDir": "来自：分享/_pipe/S2",
-        "localDir": "/downloads/示例/S02",
+        "localDir": "/downloads/示例剧/S02",
+        "enabled": false
+      },
+      {
+        "name": "示例-单集补漏",
+        "type": "share",
+        "shareUrl": "https://pan.quark.cn/s/000000000000",
+        "include": ["全25集/[示例组] Example Show 25 "],
+        "saveDir": "来自：分享/_pipe/S01E25",
+        "localDir": "/downloads/示例剧/S01",
+        "maxSavedEpisodes": 1,
+        "reserveGB": 0.5,
         "enabled": false
       },
       {
         "name": "示例-只回收已下完",
         "type": "reclaim",
         "quarkDir": "来自：分享/4K",
-        "localDir": "/downloads/谷雨",
+        "localDir": "/downloads/某部剧",
         "enabled": false
       }
     ]

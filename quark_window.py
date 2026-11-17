@@ -156,12 +156,13 @@ class WindowScheduler:
     def _alist_path(self, save_dir, name):
         return "%s/%s/%s" % (self.mount_path, save_dir.strip("/"), name)
 
-    def _stoken(self, pwd_id):
-        cached = self._stoken_cache.get(pwd_id)
+    def _stoken(self, pwd_id, passcode=""):
+        key = "%s|%s" % (pwd_id, passcode)
+        cached = self._stoken_cache.get(key)
         if cached and time.time() - cached[1] < 1800:
             return cached[0]
-        st = self.quark.share_stoken(pwd_id)
-        self._stoken_cache[pwd_id] = (st, time.time())
+        st = self.quark.share_stoken(pwd_id, passcode)
+        self._stoken_cache[key] = (st, time.time())
         return st
 
     # ---------- 分享清单 ----------
@@ -180,7 +181,7 @@ class WindowScheduler:
         if cached and time.time() - cached[1] < self.items_ttl:
             return cached[0]
         pwd_id = job["pwdId"]
-        stoken = self._stoken(pwd_id)
+        stoken = self._stoken(pwd_id, job.get("passcode", ""))
         out = []
 
         def walk(fid, prefix, depth):
@@ -292,6 +293,9 @@ class WindowScheduler:
         saved = [x for x in self.quark.list_dir(save_fid) if not x["dir"]]
         st = self._job_state(job)
         changed = False
+        # 窗口大小、预留空间都允许按任务覆盖（单集补漏可以只占 1 格、少留余量）
+        max_saved = int(job.get("maxSavedEpisodes", self.max_saved))
+        reserve = int(float(job.get("reserveGB", self.cfg.get("reserveGB", 4))) * (1024 ** 3))
 
         remain = []
         for item in saved:
@@ -320,8 +324,8 @@ class WindowScheduler:
         have = {x["name"] for x in remain}
         todo = [i for i in items if i["name"] not in done and i["name"] not in have]
         total, used = self.quark.capacity()
-        budget = total - used - self.reserve_bytes
-        slots = self.max_saved - len(remain)
+        budget = total - used - reserve
+        slots = max_saved - len(remain)
         self.log("%s｜分享 %d 集，已完成 %d，网盘在盘 %d 集，剩余空间 %s，本轮可再转存 %d 集"
                  % (job["name"], len(items), len(done), len(remain), self._gb(total - used),
                     max(0, min(slots, len(todo)))))
@@ -331,13 +335,13 @@ class WindowScheduler:
             if item["size"] > budget:
                 self.log("空间不足，暂停转存：下一集 %s 需要 %s，可用 %s（预留 %s）"
                          % (item["name"], self._gb(item["size"]), self._gb(budget),
-                            self._gb(self.reserve_bytes)))
+                            self._gb(reserve)))
                 break
             if self.dry_run:
                 self.log("[dry-run] 将转存 %s（%s）" % (item["name"], self._gb(item["size"])))
             else:
                 try:
-                    self.quark.share_save(job["pwdId"], self._stoken(job["pwdId"]),
+                    self.quark.share_save(job["pwdId"], self._stoken(job["pwdId"], job.get("passcode", "")),
                                           item["fid"], item["token"], save_fid,
                                           from_pdir_fid=item["pdir_fid"])
                     self.log("已转存：%s（%s）" % (item["name"], self._gb(item["size"])))
