@@ -419,9 +419,13 @@ class WindowScheduler:
         total, used = self.quark.capacity()
         budget = total - used - reserve
         slots = max_saved - len(remain)
-        self.log("%s｜分享 %d 集，已完成 %d，网盘在盘 %d 集，剩余空间 %s，本轮可再转存 %d 集"
-                 % (job["name"], len(items), len(done), len(remain), self._gb(total - used),
-                    max(0, min(slots, len(todo)))))
+        todo_n = max(0, min(slots, len(todo)))
+        msg = ("%s｜分享 %d 集，已完成 %d，网盘在盘 %d 集，剩余空间 %s，本轮可再转存 %d 集"
+               % (job["name"], len(items), len(done), len(remain), self._gb(total - used), todo_n))
+        if self.verbose or changed or remain or todo:
+            self.log(msg)
+        else:  # 已经全部下完、无事可做的任务：每小时提一次即可，不要每分钟刷
+            self._log_throttled("idle:" + job["name"], msg, ttl=3600)
         for item in todo:
             if slots <= 0:
                 break

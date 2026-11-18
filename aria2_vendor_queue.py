@@ -163,6 +163,15 @@ def log(msg, verbose=False):
     _logger.info(msg)
 
 
+def _task_name(task):
+    """任务对应的文件名（日志用），取不到就退回 gid 前缀。"""
+    for f in (task.get("files") or []):
+        p = f.get("path") or ""
+        if p:
+            return os.path.basename(p)
+    return (task.get("gid") or "")[:8]
+
+
 class Aria2Rpc:
     def __init__(self, url, secret, timeout=15):
         self.url = url.rstrip("/")
@@ -227,6 +236,13 @@ class Scheduler:
         self.default_cat = cfg.get("defaultCategory", "默认")
         self.default_quota = int(cfg.get("defaultMaxConcurrent", 1))
 
+        # 插队规则：URL 路径命中这些子串的任务，排队号排到"正在下载的任务之后、
+        # 其余排队任务之前"。用于让某一批任务跳过同厂商的 FIFO 队列先下。
+        prio = cfg.get("priorityMatch") or []
+        if isinstance(prio, str):
+            prio = [prio]
+        self.priority_pats = [urllib.parse.unquote(p) for p in prio]
+
         state_file = cfg.get("stateFile") or os.path.join(cfg_dir, "state.json")
         self.state_file = os.path.abspath(state_file)
         self.state = {"tasks": {}, "nextSeq": 1}
@@ -257,19 +273,32 @@ class Scheduler:
                     return uri
         return ""
 
-    def category_of(self, task):
+    def _decoded_path(self, task):
+        """取任务 URL 里解码后的路径（中文目录在 URL 里是百分号编码的）。"""
         uri = self._first_uri(task)
         if not uri:
-            return self.default_cat
+            return ""
         try:
-            path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
+            return urllib.parse.unquote(urllib.parse.urlparse(uri).path)
         except Exception:
-            path = uri
+            return uri
+
+    def category_of(self, task):
+        path = self._decoded_path(task)
+        if not path:
+            return self.default_cat
         for name, pats in self.matchers:
             for p in pats:
                 if p in path:
                     return name
         return self.default_cat
+
+    def is_priority(self, task):
+        """是否命中 priorityMatch（插队规则）。"""
+        if not self.priority_pats:
+            return False
+        path = self._decoded_path(task)
+        return bool(path) and any(p in path for p in self.priority_pats)
 
     def _save_state(self):
         tmp = self.state_file + ".tmp"
@@ -323,6 +352,7 @@ class Scheduler:
         tasks = self.state["tasks"]
 
         # 1. 为新出现的任务按发现顺序编号（active -> waiting -> paused 由旧到新）
+        new_prio = []  # 本轮新发现的插队任务，稍后重排 seq
         for t in active + waiting + paused[::-1]:
             g = t["gid"]
             if g not in tasks:
@@ -331,8 +361,11 @@ class Scheduler:
                             "pausedByUs": False}
                 self.state["nextSeq"] += 1
                 state_changed = True
+                if self.is_priority(t):
+                    new_prio.append(g)
                 if self.verbose:
-                    log("发现新任务 %s -> 分类[%s] seq=%d" % (g, cat, tasks[g]["seq"]))
+                    log("发现新任务 %s -> 分类[%s] seq=%d%s"
+                        % (g, cat, tasks[g]["seq"], "（插队）" if g in new_prio else ""))
 
         # 2. 任务已被启动（active）→ 清除"由我们暂停"的标记（例如用户手动恢复过它）
         for t in active:
@@ -347,6 +380,36 @@ class Scheduler:
         for g in [g for g in list(tasks.keys()) if g not in live or g in finished]:
             del tasks[g]
             state_changed = True
+
+        # 3.5 插队：把新发现的优先任务排到"正在下载的任务之后、其余排队任务之前"
+        #     不去动正在下载的任务（它已经下了半天，打断它更浪费），只插到它后面。
+        if new_prio:
+            new_prio = [g for g in new_prio if g in tasks]
+            active_gids = {t["gid"] for t in active}
+            # 只参考"与插队无关的"正在下载任务：aria2 全局并发若 > 分类并发，
+            # 插队任务在 addUri 后会被 aria2 立刻启动，它们自己也在 active 里，
+            # 若一并计入就会把基准算到自己头上，反而排到最后。
+            act_seqs = [tasks[g]["seq"] for g in active_gids
+                        if g in tasks and g not in new_prio]
+            if new_prio and act_seqs:
+                lo = max(act_seqs)
+                for g, e in tasks.items():  # 其余排队任务整体后移，腾出位置
+                    if g not in new_prio and g not in active_gids and e["seq"] > lo:
+                        e["seq"] += len(new_prio) + 1
+                for i, g in enumerate(sorted(new_prio, key=lambda x: tasks[x]["seq"])):
+                    tasks[g]["seq"] = lo + 1 + i
+            elif new_prio:  # 没有"别人的"任务在下：直接排到队首
+                others = [e["seq"] for g, e in tasks.items() if g not in new_prio]
+                base = min(others) if others else 0
+                for i, g in enumerate(sorted(new_prio, key=lambda x: tasks[x]["seq"])):
+                    tasks[g]["seq"] = base - len(new_prio) + i
+            if new_prio:
+                state_changed = True
+                names = []
+                for t in active + waiting + paused:
+                    if t["gid"] in new_prio:
+                        names.append(_task_name(t))
+                log("插队任务已排到队首（当前在下的任务之后）：%s" % ", ".join(names))
 
         # 4. 按分类汇总
         #    running = 正在下载 + 正被 aria2 排进队列（waiting，随时会开跑）的任务

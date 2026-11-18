@@ -9,6 +9,7 @@
     "logMaxBytes": "单个日志文件最大字节数，达到后带时间戳轮转，默认 10M。",
     "logRetentionDays": "历史日志保留天数，超期自动清理，默认 30 天。",
     "autoAdjustGlobalLimit": "启动时是否自动把 aria2 全局 max-concurrent-downloads 调到「各分类并发之和 + 默认分类并发」。",
+    "priorityMatch": "可选，插队规则（数组）：URL 解码后路径命中任一子串的任务，排队号排到「正在下载的任务之后、其余排队任务之前」。写目标任务的 saveDir 片段最省事。留空数组 = 纯 FIFO。",
     "defaultCategory": "不匹配任何规则的下载（磁力、BT、直链等）归入的分类名。",
     "defaultMaxConcurrent": "默认分类的并发上限。",
     "categories": {
@@ -66,6 +67,7 @@
   "logMaxBytes": 10485760,
   "logRetentionDays": 30,
   "autoAdjustGlobalLimit": true,
+  "priorityMatch": [],
   "defaultCategory": "默认",
   "defaultMaxConcurrent": 1,
   "categories": [

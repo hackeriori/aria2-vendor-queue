@@ -93,6 +93,7 @@ python3 aria2_vendor_queue.py --verbose
 | `categories[].name` | 分类名（仅用于日志） |
 | `categories[].match` | URL 解码后路径的子串匹配规则（写 Alist 挂载名即可，支持多条） |
 | `categories[].maxConcurrent` | 该分类并发上限。**不限速的厂商可调大** |
+| `priorityMatch` | 可选，插队列字符串（数组）：URL 解码后路径命中任一串的任务排到队首，见 [临时插队](#临时插队跳过厂商的-fifo) |
 
 **注意**：挂载名改了 / 新增挂载时，同步更新 `match` 规则即可（也可以为同一个厂商写多条匹配串）。
 
@@ -291,6 +292,10 @@ docker exec -w /app aria2-vendor-queue \
 `state/quark-window.json` 按任务名记录"已下完并已删"的清单，所以同一个任务重启后不会重复转存；
 **改任务名等于换了一个新任务**，该剧会从头再转一遍——改名时记得同步改 `name` 之外的状态，或直接接受重来。
 
+**任务不会被自动删除**：程序只读 `config.json`，从不回写。一季下完后那个任务对象会一直留在配置里
+空转（每轮列一次分享、什么都不做，日志已改成每小时才提一次）。留着无害，想清爽就把 `enabled`
+改 `false`——`state` 里的完成记录不受影响，改回来能接着上次的进度。
+
 ### 验证与观察
 
 ```bash
@@ -364,6 +369,32 @@ Environment=ARIA2_RPC_SECRET=你的密钥
 [Install]
 WantedBy=multi-user.target
 ```
+
+## 临时插队（跳过厂商的 FIFO）
+
+同厂商任务默认按添加顺序排队，但总有"这个先下"的时候。加一个普通的 `share` 任务，
+再把它的下载路径登记到顶层 `priorityMatch`，它就会被排到**当前正在下载的任务之后、
+其余排队任务之前**——正在下的那集不打断（已经下了一半，打断更浪费），下完立刻轮到它。
+
+```json
+{
+  "priorityMatch": ["_pipe/谷雨27-30"],
+  ...
+  "quark": { "jobs": [
+    { "name": "谷雨27-30", "type": "share",
+      "shareUrl": "https://pan.quark.cn/s/528017e909dd",
+      "include": ["硲雨/27.", "硲雨/28.", "硲雨/29.", "硲雨/30."],
+      "saveDir": "来自：分享/_pipe/谷雨27-30",
+      "localDir": "/downloads/谷雨",
+      "maxSavedEpisodes": 4, "reserveGB": 0.5, "enabled": true }
+  ]}
+}
+```
+
+- `priorityMatch` 匹配的是**解码后的 URL 路径**，写 `saveDir` 里那段唯一部分最省事；
+- 插队任务下完后，被跳过的任务**自动接回**，不需要人工恢复；
+- 只想插一段时间的队：把 `priorityMatch` 清空并重启即可（任务本身留在队列里正常排）；
+- 队列深度只有 1~2（窗口机制），所以插队的影响面很小，一般就是"跳过下一集"。
 
 ## 行为与注意事项
 
