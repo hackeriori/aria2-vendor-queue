@@ -52,12 +52,18 @@ class WindowScheduler:
         self.delete_after_done = bool(cfg.get("deleteAfterDone", True))
         self.max_retries = int(cfg.get("maxRetries", 6))
         self.mount_path = (cfg.get("alistMountPath") or "/夸克").rstrip("/")
-        self.jobs = [j for j in (cfg.get("jobs") or []) if j.get("enabled", True)]
-        for j in self.jobs:  # 分享链接里直接解析 pwd_id，配置只写 shareUrl 即可
+        raw_jobs = list(cfg.get("jobs") or [])
+        for j in raw_jobs:  # 分享链接里直接解析 pwd_id，配置只写 shareUrl 即可
             if j.get("type", "share") == "share" and not j.get("pwdId"):
                 m = re.search(r"/s/([0-9a-zA-Z]+)", j.get("shareUrl") or "")
                 if m:
                     j["pwdId"] = m.group(1)
+        # 全部任务都建索引（含 enabled=false）：after 闸门要能查看已禁用上游的进度
+        self.all_jobs = {j["name"]: j for j in raw_jobs if j.get("name")}
+        self.jobs = [j for j in raw_jobs if j.get("enabled", True)]
+        self._log_throttle = {}   # key -> 上次打印时间，用于抑制重复日志
+        self._gate_prev = {}      # 任务名 -> 上一轮闸门是否放行
+        self._break_cycles()
 
         state_file = cfg.get("stateFile") or os.path.join(cfg_dir, "state", "quark-window.json")
         self.state_file = os.path.abspath(
@@ -286,6 +292,93 @@ class WindowScheduler:
         self.log("已入队：%s（第 %d 次）" % (name, retry["count"]))
         return True
 
+    # ---------- after 顺序闸门 ----------
+
+    @staticmethod
+    def _after_names(job):
+        """job.after 支持单个任务名，也支持名称数组（全部满足才放行）。"""
+        a = job.get("after")
+        if not a:
+            return []
+        if isinstance(a, str):
+            return [a]
+        return [x for x in a if x]
+
+    def _break_cycles(self):
+        """after 成环会让相关任务永远等下去：检测到环就报警，并对环上任务强制放行。"""
+        graph = {n: [x for x in self._after_names(j) if x in self.all_jobs]
+                 for n, j in self.all_jobs.items()}
+        color, stack, cyc = {}, [], set()
+
+        def dfs(u):
+            color[u] = 1
+            stack.append(u)
+            for v in graph.get(u, []):
+                if color.get(v) == 1:
+                    cyc.update(stack[stack.index(v):])
+                elif v not in color:
+                    dfs(v)
+            stack.pop()
+            color[u] = 2
+
+        for n in graph:
+            if n not in color:
+                dfs(n)
+        for n in cyc:
+            self.all_jobs[n]["afterIgnore"] = True
+        if cyc:
+            self.log("配置错误：after 成环（%s），已对环上任务强制放行以免永久卡住"
+                     % ", ".join(sorted(cyc)))
+
+    def _log_throttled(self, key, msg, ttl=1800, force=False):
+        """同一个 key 的消息在 ttl 秒内只打一次（force 时立即打），避免每轮刷屏。"""
+        now = time.time()
+        if force or now - self._log_throttle.get(key, 0) >= ttl:
+            self.log(msg)
+            self._log_throttle[key] = now
+
+    def _upstream_state(self, name):
+        """上游任务的状态：分享里匹配到的文件是否全部已本地下完。
+
+        以“本地文件完整”而不是 state 里的 done 记录判断，这样 deleteAfterDone=false、
+        换过 state 文件、或上游被 enabled=false 禁用时都不会误判。分享清单有
+        shareCacheSec 缓存，重复调用开销可接受。
+        """
+        up = self.all_jobs.get(name)
+        if up is None:
+            return "missing", 0, 0
+        if up.get("type", "share") != "share" or not up.get("localDir"):
+            return "invalid", 0, 0
+        items = self._share_items(up)
+        if not items:
+            return "empty", 0, 0
+        remain = 0
+        for it in items:
+            if not self._local_done(os.path.join(up["localDir"], it["name"]), it["size"]):
+                remain += 1
+        return ("done" if remain == 0 else "pending"), remain, len(items)
+
+    def _gate(self, job):
+        """返回 (是否放行, 未放行的原因)。after 里的任务全部下完才放行。"""
+        names = self._after_names(job)
+        if job.get("afterIgnore") or not names:
+            return True, ""
+        for n in names:
+            try:
+                state, remain, total = self._upstream_state(n)
+            except Exception as e:
+                return False, "检查上游 %s 出错（下轮重试）: %s" % (n, e)
+            if state == "missing":
+                return False, "after 指向的任务不存在: %s" % n
+            if state == "invalid":
+                return False, "after 只能指向 share 类型且有 localDir 的任务: %s" % n
+            if state == "empty":
+                return False, "上游 %s 的 include 未匹配到任何文件（规则写错或分享失效）" % n
+            if state == "pending":
+                return False, ("等待上游 %s（分享 %d 个文件，还有 %d 个未下完）"
+                               % (n, total, remain))
+        return True, ""
+
     # ---------- 两类任务 ----------
 
     def _handle_share(self, job, inflight):
@@ -333,9 +426,11 @@ class WindowScheduler:
             if slots <= 0:
                 break
             if item["size"] > budget:
-                self.log("空间不足，暂停转存：下一集 %s 需要 %s，可用 %s（预留 %s）"
-                         % (item["name"], self._gb(item["size"]), self._gb(budget),
-                            self._gb(reserve)))
+                self._log_throttled(
+                    "nospace:" + job["name"],
+                    "空间不足，暂停转存：下一集 %s 需要 %s，可用 %s（预留 %s）"
+                    % (item["name"], self._gb(item["size"]), self._gb(budget),
+                       self._gb(reserve)), ttl=900)
                 break
             if self.dry_run:
                 self.log("[dry-run] 将转存 %s（%s）" % (item["name"], self._gb(item["size"])))
@@ -375,13 +470,25 @@ class WindowScheduler:
         inflight = self._inflight()
         changed = False
         for job in self.jobs:
+            name = job.get("name", "?")
             try:
+                ok, why = self._gate(job)
+                if not ok:
+                    prev = self._gate_prev.get(name)
+                    # 首次被拦、或刚从放行变为拦截时立即打；之后每 30 分钟提醒一次
+                    self._log_throttled("gate:" + name, "%s｜本轮跳过：%s" % (name, why),
+                                        force=(prev is not False))
+                    self._gate_prev[name] = False
+                    continue
+                if self._gate_prev.get(name) is False:
+                    self.log("%s｜上游已完成，开始参与调度" % name)
+                self._gate_prev[name] = True
                 if job.get("type", "share") == "reclaim":
                     changed |= self._handle_reclaim(job, inflight)
                 else:
                     changed |= self._handle_share(job, inflight)
             except Exception as e:
-                self.log("任务[%s]本轮出错（下轮继续）: %s" % (job.get("name"), e))
+                self.log("任务[%s]本轮出错（下轮继续）: %s" % (name, e))
         if changed:
             self._save_state()
 
@@ -390,6 +497,13 @@ class WindowScheduler:
         self.log("转存窗口调度器启动：%d 个任务（%s）｜窗口 %d 集｜预留 %s｜轮询 %ss｜dry_run=%s"
                  % (len(self.jobs), names, self.max_saved, self._gb(self.reserve_bytes),
                     self.interval, self.dry_run))
+        skipped = [n for n in self.all_jobs if n not in {j.get("name") for j in self.jobs}]
+        if skipped:
+            self.log("已按 enabled=false 跳过 %d 个任务：%s" % (len(skipped), ", ".join(skipped)))
+        gated = ["%s←%s" % (j.get("name"), "+".join(self._after_names(j)))
+                 for j in self.jobs if self._after_names(j) and not j.get("afterIgnore")]
+        if gated:
+            self.log("顺序闸门生效（上游全部下完才启动）：%s" % ", ".join(gated))
         while True:
             try:
                 self.tick()
