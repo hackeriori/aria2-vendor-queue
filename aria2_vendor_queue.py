@@ -256,6 +256,21 @@ class Scheduler:
             except Exception as e:
                 log("状态文件损坏，将重建: %s" % e)
 
+        # 兼容历史状态：seq 缺失时补号；nextSeq 落后于实际最大 seq 时先修一遍。
+        # 否则新任务会分到已被占用的排队号（seq 并列 → 排序退化成 gid 字典序），
+        # 插队任务就会莫名其妙被后来的任务抢到前面。
+        worst = 0
+        for g, e in list(self.state["tasks"].items()):
+            if not isinstance(e, dict):
+                e = self.state["tasks"][g] = {}
+            e.setdefault("category", self.default_cat)
+            e.setdefault("pausedByUs", False)
+            if not isinstance(e.get("seq"), int):
+                e["seq"] = worst + 1
+            worst = max(worst, e["seq"])
+        if not isinstance(self.state.get("nextSeq"), int) or self.state["nextSeq"] <= worst:
+            self.state["nextSeq"] = worst + 1
+
     # ---------- 基础工具 ----------
 
     def quota_of(self, cat):
@@ -299,6 +314,51 @@ class Scheduler:
             return False
         path = self._decoded_path(task)
         return bool(path) and any(p in path for p in self.priority_pats)
+
+    def queue_order(self):
+        """当前已知任务的排队顺序（seq 升序），调试/测试用。"""
+        tasks = self.state["tasks"]
+        return sorted(tasks, key=lambda g: (tasks[g]["seq"], g))
+
+    def _rebuild_queue(self, prio_gids, active_gids):
+        """重排全队列：插队组紧跟各分类正在下载的任务，seq 压成 1..N 唯一。
+
+        只有分类内部的先后会影响调度（暂停/恢复都按分类取队列），所以按分类拼出
+        全序即可；分类之间按最小 seq 排序，保证每轮重排结果稳定、不会来回抖。
+
+        "正在下载的任务" 只认该分类里 seq 最小的那个 active 任务：aria2 的全局并发
+        大于分类并发，新任务 addUri 后会被立刻启动而短暂出现在 active 里，
+        若把它当成锚点，插队组反而会被它挤到后面。
+        """
+        tasks = self.state["tasks"]
+        blocks = {}
+        for g, e in tasks.items():
+            blocks.setdefault(e.get("category") or self.default_cat, []).append(g)
+        ordered = []
+        for rows in blocks.values():
+            rows.sort(key=lambda g: (tasks[g]["seq"], g))
+            incumbent = next((g for g in rows if g in active_gids), None)
+            group = [g for g in rows if g in prio_gids and g != incumbent]
+            head = set(group) | ({incumbent} if incumbent else set())
+            order = ([incumbent] if incumbent else []) + group + \
+                    [g for g in rows if g not in head]
+            ordered.append((tasks[rows[0]]["seq"], order))
+        ordered.sort(key=lambda b: b[0])
+        return self._renumber([g for _, blk in ordered for g in blk])
+
+    def _renumber(self, order):
+        """把 order 里任务重排成 seq = 1..N，并让 nextSeq 始终大于所有已用号。"""
+        tasks = self.state["tasks"]
+        changed = False
+        for i, g in enumerate(order, 1):
+            if tasks[g]["seq"] != i:
+                tasks[g]["seq"] = i
+                changed = True
+        nxt = len(order) + 1
+        if self.state.get("nextSeq") != nxt:
+            self.state["nextSeq"] = nxt
+            changed = True
+        return changed
 
     def _save_state(self):
         tmp = self.state_file + ".tmp"
@@ -381,34 +441,23 @@ class Scheduler:
             del tasks[g]
             state_changed = True
 
-        # 3.5 插队：把新发现的优先任务排到"正在下载的任务之后、其余排队任务之前"
-        #     不去动正在下载的任务（它已经下了半天，打断它更浪费），只插到它后面。
+        # 3.5 排队顺序整理（每轮都做，幂等）：
+        #   a) priorityMatch 命中的任务（插队组）整体紧跟"该分类正在下载的任务"之后、
+        #      排在该分类其余排队任务之前。绝不能只在新任务出现时算一次 —— 那样后续
+        #      入队的任务会带着旧的 seq 挤进插队组中间；而且历史遗留的反转/并列 seq
+        #      也会让"在下的任务"排位对不上，插队直接失效。
+        #   b) 全队列 seq 重排成 1..N 且唯一。seq 一旦并列，排序就退化成 gid 字典序，
+        #      谁先下变成随机；重排后新任务拿到的一定是最大号（排到队尾）。
+        prio_now = {t["gid"] for t in active + waiting + paused
+                    if t["gid"] in tasks and self.is_priority(t)}
+        active_gids = {t["gid"] for t in active}
+        if self._rebuild_queue(prio_now, active_gids):
+            state_changed = True
         if new_prio:
-            new_prio = [g for g in new_prio if g in tasks]
-            active_gids = {t["gid"] for t in active}
-            # 只参考"与插队无关的"正在下载任务：aria2 全局并发若 > 分类并发，
-            # 插队任务在 addUri 后会被 aria2 立刻启动，它们自己也在 active 里，
-            # 若一并计入就会把基准算到自己头上，反而排到最后。
-            act_seqs = [tasks[g]["seq"] for g in active_gids
-                        if g in tasks and g not in new_prio]
-            if new_prio and act_seqs:
-                lo = max(act_seqs)
-                for g, e in tasks.items():  # 其余排队任务整体后移，腾出位置
-                    if g not in new_prio and g not in active_gids and e["seq"] > lo:
-                        e["seq"] += len(new_prio) + 1
-                for i, g in enumerate(sorted(new_prio, key=lambda x: tasks[x]["seq"])):
-                    tasks[g]["seq"] = lo + 1 + i
-            elif new_prio:  # 没有"别人的"任务在下：直接排到队首
-                others = [e["seq"] for g, e in tasks.items() if g not in new_prio]
-                base = min(others) if others else 0
-                for i, g in enumerate(sorted(new_prio, key=lambda x: tasks[x]["seq"])):
-                    tasks[g]["seq"] = base - len(new_prio) + i
-            if new_prio:
-                state_changed = True
-                names = []
-                for t in active + waiting + paused:
-                    if t["gid"] in new_prio:
-                        names.append(_task_name(t))
+            live_prio = [g for g in new_prio if g in tasks]
+            if live_prio:
+                names = [_task_name(t) for t in active + waiting + paused
+                         if t["gid"] in live_prio]
                 log("插队任务已排到队首（当前在下的任务之后）：%s" % ", ".join(names))
 
         # 4. 按分类汇总
