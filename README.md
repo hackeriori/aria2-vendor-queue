@@ -81,7 +81,7 @@ python3 aria2_vendor_queue.py --verbose
 
 | 字段 | 说明 |
 |---|---|
-| `rpc` | aria2 JSON-RPC 地址，如 `https://aria2.xxx.com/jsonrpc` |
+| `rpc` | aria2 JSON-RPC 地址，如 `https://<你的域名>/jsonrpc`（同机容器内可用服务名，见部署一节） |
 | `secret` | aria2 RPC 密钥（即 aria2 的 `--rpc-secret`；AriaNg 设置里存的是 base64，需用解码后的原文） |
 | `secretEnv` | `secret` 为空时从此环境变量读取，默认 `ARIA2_RPC_SECRET` |
 | `pollIntervalSec` | 轮询间隔，默认 3 秒（越小响应越快，开销可忽略） |
@@ -154,10 +154,10 @@ Alist 里删旧的腾空间 → Windows 浏览器打开分享链接保存 3 集
   "maxSavedEpisodes": 2,
   "deleteAfterDone": true,
   "alistMountPath": "/夸克",
-  "alist": { "baseUrl": "http://alist:5244", "username": "admin", "password": "***" },
+  "alist": { "baseUrl": "http://<alist 服务名>:5244", "username": "<账号>", "password": "<密码>" },
   "jobs": [
     { "name": "示例剧S2", "type": "share",
-      "shareUrl": "https://pan.quark.cn/s/xxxxxxxx",
+      "shareUrl": "<你的夸克分享链接>",
       "include": ["S2"],
       "saveDir": "来自：分享/_pipe/示例剧S2",
       "localDir": "/downloads/示例剧/S02",
@@ -237,29 +237,29 @@ budget = total - used - reserve
 
 ```json
 {
-  "name": "巨人S3上",
+  "name": "示例剧S3",
   "type": "share",
-  "shareUrl": "https://pan.quark.cn/s/095ed5f6a2c2",
+  "shareUrl": "<你的夸克分享链接>",
   "include": ["S3 Part1"],
-  "saveDir": "来自：分享/_pipe/S3上",
-  "localDir": "/downloads/进击的巨人/S03",
-  "after": "巨人S2",
+  "saveDir": "来自：分享/_pipe/示例剧S3",
+  "localDir": "/downloads/示例剧/S03",
+  "after": "示例剧S2",
   "enabled": true
 }
 ```
 
-含义：`巨人S2` 这个任务的分享里、`include` 匹配到的文件**全部本地下完**之后，`巨人S3上`
+含义：`示例剧S2` 这个任务的分享里、`include` 匹配到的文件**全部本地下完**之后，`示例剧S3`
 才开始参与（转存 / 入队 / 回收）。于是配置一次、重启一次，之后每一季下完自动接下一季。
 
 | 要点 | 说明 |
 |---|---|
 | 完成判定 | 上游分享里匹配到的文件"本地完整"——没有 `.aria2` 控制文件且大小相等。**不依赖 `state` 里的 done 记录**，所以 `deleteAfterDone: false`、换过 state 文件、甚至上游自己 `enabled: false` 都能正确判断 |
-| 多上游 | `"after": ["巨人S2", "OAD"]` 形式，全部下完才放行 |
+| 多上游 | `"after": ["示例剧S2", "示例剧OAD"]` 形式，全部下完才放行 |
 | 上游不存在 / 类型不对 | `after` 指向的名字没配、或指向 `reclaim` 任务 → 拦住不跑，日志说明原因（30 分钟提醒一次），不会静默跳过 |
 | 上游匹配不到文件 | 上游 `include` 写错或分享失效时，会拦住并提示"未匹配到任何文件"——这时去核上游规则，别让它卡住整条链 |
 | 上游缺集 | 如果分享里本身少一集，上游永远"未完成"。手动把该任务的 `"afterIgnore": true` 放行即可 |
 | 成环 | A 等 B、B 等 A 这类配置错误，启动时检测到会对环上任务强制放行并打错误日志，不会永久卡死 |
-| 启动可见性 | 启动日志会列出 `enabled=false` 跳过的任务、以及生效的闸门清单（`S3上←巨人S2` 形式） |
+| 启动可见性 | 启动日志会列出 `enabled=false` 跳过的任务、以及生效的闸门清单（`S3←S2` 形式） |
 
 > 被闸门拦住的任务只是"本轮跳过"，不占窗口、不抢配额。日志只在**首次被拦**和**放行**时打，
 > 中间每 30 分钟提醒一次；`空间不足` 同样做了抑制（15 分钟一次），全开多季不会刷屏。
@@ -336,8 +336,8 @@ cat state/quark-window.json
   vendor-queue:
     image: python:3.12-alpine
     restart: unless-stopped
-    # 必须和 aria2 / alist 在同一个 docker 网络，否则 http://alist:5244、http://aria2:6800 解析不到
-    networks: ["Aria2"]
+    # 必须和 aria2 / alist 在同一个 docker 网络，否则容器服务名解析不到
+    networks: ["<你的网络名>"]
     environment:
       - TZ=CST-8
       # 可选：用环境变量代替 config.json 里的明文 cookie
@@ -348,7 +348,7 @@ cat state/quark-window.json
       - /你的下载目录:/downloads
     working_dir: /app
     command: python aria2_vendor_queue.py
-    # 若 rpc 走内网地址，写 http://aria2:6800/jsonrpc 即可
+    # 若 rpc 走内网，写 http://<aria2 服务名>:6800/jsonrpc 即可
 ```
 
 **systemd 服务：**
@@ -378,14 +378,14 @@ WantedBy=multi-user.target
 
 ```json
 {
-  "priorityMatch": ["_pipe/谷雨27-30"],
+  "priorityMatch": ["_pipe/示例剧27-30"],
   ...
   "quark": { "jobs": [
-    { "name": "谷雨27-30", "type": "share",
-      "shareUrl": "https://pan.quark.cn/s/528017e909dd",
-      "include": ["硲雨/27.", "硲雨/28.", "硲雨/29.", "硲雨/30."],
-      "saveDir": "来自：分享/_pipe/谷雨27-30",
-      "localDir": "/downloads/谷雨",
+    { "name": "示例剧27-30", "type": "share",
+      "shareUrl": "<你的夸克分享链接>",
+      "include": ["示例目录/27.", "示例目录/28.", "示例目录/29.", "示例目录/30."],
+      "saveDir": "来自：分享/_pipe/示例剧27-30",
+      "localDir": "/downloads/示例剧",
       "maxSavedEpisodes": 4, "reserveGB": 0.5, "enabled": true }
   ]}
 }
