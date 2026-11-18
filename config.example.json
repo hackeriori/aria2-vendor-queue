@@ -21,8 +21,10 @@
     "quark": {
       "_说明": "夸克「转存窗口」调度器：小容量网盘 + 大文件时的自动转存/下载/清理闭环。不需要可整体删掉或 enabled=false。",
       "enabled": "是否启用转存窗口调度。false 时只跑厂商队列调度。",
-      "cookie": "夸克网页版 cookie（浏览器 F12 复制整段）。留空则读 cookieEnv 指定的环境变量，建议用环境变量避免明文。",
+      "cookieFromAlist": "默认 true：启动时从 Alist 的夸克存储配置里直接取 cookie，勾选后本文件不需要再填 cookie（cookie 只在 Alist 维护一份）。运行中 cookie 失效还会再取一次，在 Alist 改完不必重启。取不到时才回退到下面的 cookie / 环境变量。",
+      "cookie": "夸克网页版 cookie（浏览器 F12 复制整段）。cookieFromAlist=true 时可留空；留空则读 cookieEnv 指定的环境变量。建议不用明文。",
       "cookieEnv": "存放 cookie 的环境变量名，默认 QUARK_COOKIE。",
+      "quarkDriver": "Alist 里夸克存储的 driver 名，默认 Quark（Alist 后台「存储 → 驱动」那一栏）。",
       "pollIntervalSec": "转存窗口轮询间隔（秒），默认 60。转存/删除都是慢动作，不需要更快。",
       "dryRun": "true = 只打印将要执行的动作，不转存、不入队、不删除。上线前先用它验证一遍。",
       "reserveGB": "全局预留空间（GB），默认 4。避免把配额吃满导致转存失败；可按任务覆盖。",
@@ -33,9 +35,9 @@
       "alistMountPath": "夸克在 Alist 里的挂载路径，如 /夸克。用于拼出取直链所需的 Alist 路径。",
       "stateFile": "运行状态（已完成/已删除记录）文件路径，默认 state/quark-window.json。",
       "alist": {
-        "_说明": "取 /d/ 直链必须登录 Alist（直链签名只能由 Alist 生成）。建议单独建一个只读该挂载的账号，不要用管理员。",
+        "_说明": "取 /d/ 直链必须登录 Alist（直链签名只能由 Alist 生成）。注意：cookieFromAlist=true 时要读存储配置，这个账号必须是 Alist 管理员；只有想用普通只读账号时才需要把 cookieFromAlist 关掉、改在本文件里填 cookie。",
         "baseUrl": "Alist 地址。与 Alist 同 docker 网络时用 http://alist:5244。",
-        "username": "Alist 账号。",
+        "username": "Alist 账号（cookieFromAlist=true 时需管理员）。",
         "password": "Alist 密码。"
       },
       "jobs": {
@@ -80,8 +82,10 @@
 
   "quark": {
     "enabled": false,
+    "cookieFromAlist": true,
     "cookie": "",
     "cookieEnv": "QUARK_COOKIE",
+    "quarkDriver": "Quark",
     "pollIntervalSec": 60,
     "dryRun": false,
     "reserveGB": 4,

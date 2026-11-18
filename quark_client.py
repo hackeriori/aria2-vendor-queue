@@ -23,23 +23,48 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # 夸克任务状态：2 = 完成
 TASK_DONE = 2
 
+# 需要重新登录的错误码（cookie 过期/被踢下线）
+AUTH_CODES = (401, 31001, 31002)
+
 
 class QuarkError(Exception):
     pass
 
 
+class QuarkAuthError(QuarkError):
+    """cookie 失效。可被 cookie_provider 捕获并重新取 cookie 后重试。"""
+
+
 class QuarkClient:
-    def __init__(self, cookie, timeout=30, logger=None):
+    def __init__(self, cookie="", timeout=30, logger=None, cookie_provider=None):
+        self.cookie_provider = cookie_provider
         cookie = (cookie or "").strip()
+        if not cookie and cookie_provider:
+            cookie = (cookie_provider() or "").strip()
         if not cookie:
             raise QuarkError("夸克 cookie 为空")
         self.cookie = cookie
         self.timeout = timeout
         self.log = logger or (lambda msg: None)
 
+    def _reload_cookie(self):
+        """cookie 失效时回调 cookie_provider 重新取一份（如从 Alist 存储配置读）。"""
+        if not self.cookie_provider:
+            return False
+        try:
+            new = (self.cookie_provider() or "").strip()
+        except Exception as e:
+            self.log("重新读取夸克 cookie 失败: %s" % e)
+            return False
+        if not new or new == self.cookie:
+            return False
+        self.cookie = new
+        self.log("已重新读取夸克 cookie（长度 %d），重试请求" % len(new))
+        return True
+
     # ---------- 底层 ----------
 
-    def _request(self, path, params=None, body=None, method=None):
+    def _request(self, path, params=None, body=None, method=None, _retry=True):
         q = {"pr": "ucpro", "fr": "pc"}
         q.update(params or {})
         url = BASE + path + "?" + urllib.parse.urlencode(q, safe="")
@@ -61,17 +86,28 @@ class QuarkClient:
                 raw = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
+            if e.code == 401 and _retry and self._reload_cookie():
+                return self._request(path, params, body, method, _retry=False)
             try:
                 payload = json.loads(raw)
             except Exception:
                 raise QuarkError("HTTP %s %s: %s" % (e.code, path, raw[:200]))
+            if payload.get("code") in AUTH_CODES:
+                raise QuarkAuthError("%s 需要登录（cookie 失效）: %s %s"
+                                     % (path, payload.get("code"), payload.get("message")))
             raise QuarkError("%s 失败: %s %s" % (path, payload.get("code"), payload.get("message")))
         except urllib.error.URLError as e:
             raise QuarkError("%s 网络错误: %s" % (path, e))
         try:
-            return json.loads(raw)
+            payload = json.loads(raw)
         except Exception:
             raise QuarkError("%s 返回非 JSON: %s" % (path, raw[:200]))
+        if isinstance(payload, dict) and payload.get("code") in AUTH_CODES:
+            if _retry and self._reload_cookie():
+                return self._request(path, params, body, method, _retry=False)
+            raise QuarkAuthError("%s 需要登录（cookie 失效）: %s %s"
+                                 % (path, payload.get("code"), payload.get("message")))
+        return payload
 
     @staticmethod
     def _ok(resp, path):

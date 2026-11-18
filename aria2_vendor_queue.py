@@ -565,19 +565,34 @@ class Scheduler:
                 return
 
 
+def _check_quark_cookie(quark, wlog):
+    """启动时校验一次 cookie。网络抖动不否决（不该因启动瞬间的网络问题停掉流水线）。"""
+    from quark_client import QuarkAuthError, QuarkError
+    try:
+        total, used = quark.capacity()
+    except QuarkAuthError as e:
+        wlog.info("夸克 cookie 校验失败（已失效）: %s" % e)
+        return False
+    except QuarkError as e:
+        wlog.info("夸克 cookie 校验时接口/网络异常，先继续跑: %s" % e)
+        return True
+    wlog.info("夸克 cookie 校验通过：总 %.1fGB 已用 %.1fGB" % (total / 2 ** 30, used / 2 ** 30))
+    return True
+
+
 def build_window(cfg, cfg_dir, rpc, dry_run, verbose):
-    """按 config.quark 构造转存窗口调度器；未启用或未配置 cookie 时返回 None。"""
+    """按 config.quark 构造转存窗口调度器；未启用或拿不到 cookie 时返回 None。
+
+    cookie 来源优先级：
+      1. quark.cookieFromAlist（默认 true）→ 从 Alist 的存储配置里现取，只需在 Alist 维护一份；
+      2. quark.cookie；
+      3. quark.cookieEnv 指定的环境变量。
+    运行中 cookie 失效时，会再向 Alist 取一次（在 Alist 改完不必重启本程序）。
+    """
     qcfg = cfg.get("quark") or {}
     if not qcfg.get("enabled"):
         return None
     wlog = logging.getLogger("quark-window")
-    cookie = (qcfg.get("cookie") or "").strip()
-    if not cookie:
-        env_name = qcfg.get("cookieEnv", "QUARK_COOKIE")
-        cookie = (os.environ.get(env_name) or "").strip()
-    if not cookie:
-        wlog.info("未配置夸克 cookie（config.quark.cookie 或环境变量），跳过转存窗口调度")
-        return None
     try:
         from alist_client import AlistClient
         from quark_client import QuarkClient
@@ -587,10 +602,45 @@ def build_window(cfg, cfg_dir, rpc, dry_run, verbose):
         if not acfg.get("baseUrl") or not acfg.get("username"):
             wlog.info("config.quark.alist 未配置 baseUrl/username，跳过转存窗口调度")
             return None
-        quark = QuarkClient(cookie, logger=wlog.info)
+
         alist = AlistClient(acfg.get("baseUrl"), acfg.get("username"),
                             acfg.get("password", ""), logger=wlog.info)
         alist.login()
+
+        from_alist = qcfg.get("cookieFromAlist", True)
+        mount = qcfg.get("alistMountPath")
+        driver = qcfg.get("quarkDriver", "Quark")
+
+        def _cookie_from_alist():
+            return alist.storage_cookie(mount, driver=driver)
+
+        provider = _cookie_from_alist if from_alist else None
+
+        cookie = ""
+        if from_alist:
+            try:
+                cookie = _cookie_from_alist()
+                wlog.info("夸克 cookie 取自 Alist 存储 %s（长度 %d）" % (mount or driver, len(cookie)))
+            except Exception as e:
+                wlog.info("从 Alist 读取夸克 cookie 失败，回退到本地配置: %s" % e)
+        if not cookie:
+            cookie = (qcfg.get("cookie") or "").strip()
+            if cookie:
+                wlog.info("夸克 cookie 取自 config.quark.cookie")
+        if not cookie:
+            env_name = qcfg.get("cookieEnv", "QUARK_COOKIE")
+            cookie = (os.environ.get(env_name) or "").strip()
+            if cookie:
+                wlog.info("夸克 cookie 取自环境变量 %s" % env_name)
+        if not cookie:
+            wlog.info("拿不到夸克 cookie（Alist 存储 / config.quark.cookie / 环境变量都没有），"
+                      "跳过转存窗口调度")
+            return None
+
+        quark = QuarkClient(cookie, logger=wlog.info, cookie_provider=provider)
+        if not _check_quark_cookie(quark, wlog):
+            wlog.info("夸克 cookie 不可用，本轮不启动转存窗口调度（修好 cookie 后重启即可）")
+            return None
         return WindowScheduler(quark, alist, rpc, qcfg, cfg_dir,
                                dry_run=dry_run, verbose=verbose, logger=wlog.info)
     except Exception as e:
@@ -639,7 +689,7 @@ def main():
 
     if args.pipeline_only:
         if window is None:
-            print("--pipeline-only 需要 config.quark 启用，且 cookie / alist 配置完整",
+            print("--pipeline-only 需要 config.quark 启用，且能从 Alist 存储或 config 里拿到可用的 cookie",
                   file=sys.stderr)
             sys.exit(1)
         window.run(once=args.once)

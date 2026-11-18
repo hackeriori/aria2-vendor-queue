@@ -143,18 +143,35 @@ Alist 里删旧的腾空间 → Windows 浏览器打开分享链接保存 3 集
 - 删除进**夸克回收站**（可恢复），不是永久删除；
 - `quark.dryRun=true` 时只打日志不动手。
 
+### 夸克 cookie 从哪来（只维护一份）
+
+**为什么需要 cookie**：Alist 只能"读"网盘（列目录、发直链），
+转存分享（`sharepage/save`）、建目录、删除这些写操作 Alist 不对外提供接口，
+只能直接打夸克自己的 API，而夸克 API 必须带登录 cookie。
+
+**cookie 不用重复配置**：默认 `cookieFromAlist=true`，启动时通过 Alist 管理接口
+`GET /api/admin/storage/list` 读你那条夸克存储的 `addition.cookie`（Alist 里存的就是明文），
+所以 **cookie 只在 Alist 后台「存储 → 夸克」维护一份**，本程序不落地。
+
+- 启动日志会打印 `夸克 cookie 取自 Alist 存储 /夸克（长度 N）` 并做一次容量校验；
+- 运行中 cookie 失效（日志出现 `已重新读取夸克 cookie…重试请求`）会自动回 Alist 再取一次，
+  **在 Alist 里换完 cookie 不用重启本程序**；
+- 读存储配置需要**管理员**权限，`quark.alist.username` 得是 Alist 管理员（默认 admin）；
+  若你只想用只读账号，把 `cookieFromAlist` 设成 `false`，再在 `quark.cookie` 或环境变量里填；
+- 取不到时按 `cookieFromAlist → quark.cookie → 环境变量` 的顺序回退，全都没有就只跑厂商队列。
+
 ### 配置
 
 ```json
 "quark": {
   "enabled": true,
-  "cookie": "夸克网页版 cookie",
+  "cookieFromAlist": true,
   "pollIntervalSec": 60,
   "reserveGB": 4,
   "maxSavedEpisodes": 2,
   "deleteAfterDone": true,
   "alistMountPath": "/夸克",
-  "alist": { "baseUrl": "http://<alist 服务名>:5244", "username": "<账号>", "password": "<密码>" },
+  "alist": { "baseUrl": "http://<alist 服务名>:5244", "username": "<管理员账号>", "password": "<密码>" },
   "jobs": [
     { "name": "示例剧S2", "type": "share",
       "shareUrl": "<你的夸克分享链接>",
@@ -168,11 +185,13 @@ Alist 里删旧的腾空间 → Windows 浏览器打开分享链接保存 3 集
 
 | 字段 | 说明 |
 |---|---|
-| `cookie` | 夸克网页版 cookie；也可留空用环境变量 `QUARK_COOKIE` |
+| `cookieFromAlist` | 默认 `true`：夸克 cookie 直接从 Alist 的夸克存储里读，**本文件不用再填 cookie**。运行中失效还会再读一次，改完 Alist 不必重启。 |
+| `cookie` | 只在 `cookieFromAlist=false` 时才需要填；留空则用环境变量 `QUARK_COOKIE` |
+| `quarkDriver` | 可选，Alist 里夸克存储的驱动名，默认 `Quark` |
 | `reserveGB` | 预留空间，避免把配额吃满导致转存失败（默认 4） |
 | `maxSavedEpisodes` | 同时留在网盘里"未下完"的集数上限，即窗口大小（默认 2：1 集在下载 + 1 集预存） |
 | `deleteAfterDone` | 下完是否自动删网盘文件（关掉就只下载不清理） |
-| `alist.*` | 取 `/d/` 直链必须登录 Alist（签名只能由 Alist 生成），建议单独建一个只读该挂载的账号 |
+| `alist.*` | 取 `/d/` 直链必须登录 Alist（签名只能由 Alist 生成）。**`cookieFromAlist=true` 时这个账号必须是 Alist 管理员**（读存储配置需要管理权限）；只有想用普通只读账号时才关掉它、在本地填 cookie |
 | `jobs[].include` | 匹配分享内路径的子串，用来挑季/子目录（写 `S2` 只会匹配到含 `S2` 的目录） |
 | `jobs[].saveDir` | 转到夸克里的哪个目录（自动创建），每个任务用自己的目录，便于回收时精确控制范围 |
 | `jobs[].localDir` | aria2 的下载目录（**aria2 容器内的路径**，如 `/downloads/...`） |
@@ -340,7 +359,7 @@ cat state/quark-window.json
     networks: ["<你的网络名>"]
     environment:
       - TZ=CST-8
-      # 可选：用环境变量代替 config.json 里的明文 cookie
+      # 夸克 cookie 默认从 Alist 存储里读，这里不用配；除非 cookieFromAlist=false
       # - QUARK_COOKIE=...
     volumes:
       - ./aria2-vendor-queue:/app
